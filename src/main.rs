@@ -1,45 +1,91 @@
+use std::fs;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::RawFd;
+
 use libc::{c_int, c_void};
 
-const CMD_GET_VERSION: c_int = 2;
-const KERNEL_SU_OPTION: u32 = 0xDEADBEEF;
+const KSU_IOCTL_GET_INFO: u32 = 0x80004b02;
+const KSU_INSTALL_MAGIC1: u32 = 0xDEADBEEF;
+const KSU_INSTALL_MAGIC2: u32 = 0xCAFEBABE;
 
-/// 执行内核SU控制命令
-///
-/// # 参数
-/// - `cmd`: 执行的命令（CMD_* 常量）
-/// - `arg1`: 命令参数1（可为空）
-/// - `arg2`: 命令参数2（可为空）
-///
-/// # 返回值
-/// 操作是否成功（检查内核返回的魔数）
-fn ksuctl(cmd: c_int, arg1: *mut c_void, arg2: *mut c_void) -> bool {
-    unsafe {
-        let mut result: u32 = 0;
-        // 调用 prctl 系统调用
-        libc::syscall(
-            libc::SYS_prctl,
-            KERNEL_SU_OPTION as libc::c_ulong,
-            cmd as libc::c_ulong,
-            arg1 as libc::c_ulong,
-            arg2 as libc::c_ulong,
-            &mut result as *mut u32 as libc::c_ulong,
-        );
-        result == KERNEL_SU_OPTION
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GetInfoCmd {
+    version: u32,
+    flags: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn scan_driver_fd() -> Option<RawFd> {
+    let fd_dir = fs::read_dir("/proc/self/fd").ok()?;
+
+    for entry in fd_dir.flatten() {
+        if let Ok(fd_num) = entry.file_name().to_string_lossy().parse::<i32>() {
+            let link_path = format!("/proc/self/fd/{}", fd_num);
+            if let Ok(target) = fs::read_link(&link_path) {
+                let target_str = target.to_string_lossy();
+                if target_str.contains("[ksu_driver]") {
+                    return Some(fd_num);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn init_driver_fd() -> Option<RawFd> {
+    let fd = scan_driver_fd();
+    if fd.is_none() {
+        let mut fd = -1;
+        unsafe {
+            libc::syscall(
+                libc::SYS_reboot,
+                KSU_INSTALL_MAGIC1,
+                KSU_INSTALL_MAGIC2,
+                0,
+                &mut fd,
+            );
+        };
+        if fd >= 0 { Some(fd) } else { None }
+    } else {
+        fd
     }
 }
 
-/// 获取内核SU版本
-///
-/// # 返回值
-/// 版本号（获取失败返回 -1）
-fn get_version_code() -> c_int {
-    let mut version: c_int = -1;
-    ksuctl(
-        CMD_GET_VERSION,
-        &mut version as *mut c_int as *mut c_void,
-        std::ptr::null_mut(),
-    );
-    version
+// ioctl wrapper using libc
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ksuctl<T>(request: u32, arg: *mut T) -> std::io::Result<i32> {
+    use std::io;
+
+    let fd = init_driver_fd().unwrap_or(-1);
+    unsafe {
+        #[cfg(not(target_env = "gnu"))]
+        let ret = libc::ioctl(fd as libc::c_int, request as i32, arg);
+        #[cfg(target_env = "gnu")]
+        let ret = libc::ioctl(fd as libc::c_int, request as u64, arg);
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ret)
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn get_info() -> GetInfoCmd {
+    let mut cmd = GetInfoCmd {
+        version: 0,
+        flags: 0,
+    };
+    let _ = ksuctl(KSU_IOCTL_GET_INFO, &mut cmd as *mut _);
+    cmd
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn get_version_code() -> u32 {
+    get_info().version
 }
 
 fn main() {
